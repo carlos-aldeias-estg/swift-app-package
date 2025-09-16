@@ -1,26 +1,202 @@
-name: CI
+name: iOS → Appetize (Simulator)
 
-on: 
+on:
   push:
-    branches: 
-      - main
   pull_request:
-    branches: 
-      - '*'
+  workflow_dispatch:
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  # Project bits (DevYeom template defaults)
+  SCHEME: iOS
+  PROJECT: App/AppProject.xcodeproj
+  CONFIGURATION: Debug
+
+  # Xcode & Simulator targeting
+  XCODE_VERSION: "26.0.0"
+  DEST_OS: "18.6"
+  DEST_DEVICE_NAME: "iPhone 16 Pro Max"
 
 jobs:
-  ci:
-    runs-on: macos-15
-    timeout-minutes: 30
+  build-and-upload:
+    runs-on: macos-latest
+    timeout-minutes: 25
 
     steps:
-    - uses: actions/checkout@v3
-    - uses: maxim-lobanov/setup-xcode@v1.6.0
-      with:
-        xcode-version: '16.2'
-    - name: Build and Test
-      run: make test
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ env.XCODE_VERSION }}
+
+      - name: Debug environment
+        run: |
+          xcodebuild -version
+          xcode-select -p
+          echo "::group::SDKs"; xcodebuild -showsdks || true; echo "::endgroup::"
+          echo "::group::Schemes"; xcodebuild -project "$PROJECT" -list || true; echo "::endgroup::"
+          echo "::group::Runtimes"; xcrun simctl list runtimes || true; echo "::endgroup::"
+          echo "::group::Devices"; xcrun simctl list devices available || true; echo "::endgroup::"
+
+      - name: Ensure target simulator exists (iOS ${{ env.DEST_OS }} — ${{ env.DEST_DEVICE_NAME }})
+        id: sim
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Some images export this and it can point to an RC SDK; clear it just in case.
+          unset MD_APPLE_SDK_ROOT || true
+
+          # 1) Find the runtime identifier (e.g. com.apple.CoreSimulator.SimRuntime.iOS-18-6)
+          RUNTIME_ID="$(xcrun simctl list runtimes -j | python3 -c "import sys,json,os; dest=os.environ['DEST_OS']; needle=f'iOS-{dest.replace('.', '-')}' ; data=json.load(sys.stdin); print(next((rt.get('identifier','') for rt in data.get('runtimes',[]) if rt.get('isAvailable') and str(rt.get('identifier','')).endswith(needle)), ''), end='')")"
+          if [[ -z "${RUNTIME_ID}" ]]; then
+            echo "❌ iOS runtime ${DEST_OS} not installed."; xcrun simctl list runtimes; exit 1
+          fi
+          export RUNTIME_ID
+          echo "RUNTIME_ID=${RUNTIME_ID}"
+
+          # 2) Find the device type identifier (e.g. com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro-Max)
+          DEV_TYPE="$(xcrun simctl list devicetypes -j | python3 -c "import sys,json,os; target=os.environ['DEST_DEVICE_NAME']; data=json.load(sys.stdin); print(next((dt.get('identifier','') for dt in data.get('devicetypes',[]) if dt.get('name')==target), ''), end='')")"
+          if [[ -z "${DEV_TYPE}" ]]; then
+            echo "❌ Device type '${DEST_DEVICE_NAME}' not found."; xcrun simctl list devicetypes; exit 1
+          fi
+          export DEV_TYPE
+          echo "DEV_TYPE=${DEV_TYPE}"
+
+          # 3) Get existing device UDID for this runtime+name (or create one)
+          UDID="$(xcrun simctl list devices -j | python3 -c "import sys,json,os; rid=os.environ['RUNTIME_ID']; name=os.environ['DEST_DEVICE_NAME']; data=json.load(sys.stdin); print(next((d.get('udid','') for d in data.get('devices',{}).get(rid,[]) if d.get('name')==name and d.get('isAvailable')), ''), end='')")"
+          if [[ -z "${UDID}" ]]; then
+            echo "Creating simulator '${DEST_DEVICE_NAME}' on ${RUNTIME_ID}…"
+            UDID="$(xcrun simctl create "CI ${DEST_DEVICE_NAME} (${DEST_OS})" "${DEV_TYPE}" "${RUNTIME_ID}")"
+          fi
+          if [[ -z "${UDID}" ]]; then
+            echo "❌ Failed to get/create simulator UDID."; exit 1
+          fi
+          
+          # 4) Boot the simulator (helps destination resolution)
+               xcrun simctl boot "${UDID}" || true
+               xcrun simctl bootstatus "${UDID}" -b || true
+          
+          # 5) Export for next steps
+          echo "UDID=${UDID}" | tee -a "$GITHUB_ENV"
+          echo "RUNTIME_ID=${RUNTIME_ID}" | tee -a "$GITHUB_ENV"
+          echo "udid=${UDID}" >> "$GITHUB_OUTPUT"
+          echo "runtime_id=${RUNTIME_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Build for that simulator (.app)
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset MD_APPLE_SDK_ROOT || true
+          
+          # Prefer workspace if present
+          if [ -d "App/AppProject.xcworkspace" ]; then
+            echo "Using workspace App/AppProject.xcworkspace"
+            FLAGS=(-workspace "App/AppProject.xcworkspace")
+          else
+            echo "Using project $PROJECT"
+            FLAGS=(-project "$PROJECT")
+          fi
+          
+          echo "Building scheme '${SCHEME}' to UDID ${UDID} (iOS ${DEST_OS} — ${DEST_DEVICE_NAME})"
+          xcodebuild \
+            "${FLAGS[@]}" \
+            -scheme "$SCHEME" \
+            -destination "id=${UDID}" \
+            -configuration "${CONFIGURATION}" \
+            -derivedDataPath build \
+            clean build
+          
+          APP_PATH=$(find "build/Build/Products/${CONFIGURATION}-iphonesimulator" -maxdepth 1 -name "*.app" -print -quit)
+          if [[ -z "${APP_PATH}" ]]; then
+            echo "❌ No .app found under build/Build/Products/${CONFIGURATION}-iphonesimulator"
+            echo "Dumping destinations for debugging:"
+            xcodebuild "${FLAGS[@]}" -scheme "$SCHEME" -showdestinations || true
+            exit 1
+          fi
+          echo "APP_PATH=${APP_PATH}" >> "$GITHUB_ENV"
+          echo "Found app: ${APP_PATH}"
+
+      - name: Zip the .app (for Appetize)
+        shell: bash
+        run: |
+          cd "$(dirname "$APP_PATH")"
+          zip -r appetize-upload.zip "$(basename "$APP_PATH")"
+                echo "ZIP_PATH=$(pwd)/appetize-upload.zip" >> "$GITHUB_ENV"
+
+      - name: Upload to Appetize (create or update)
+        id: appetize
+        env:
+          APPETIZE_API_TOKEN: ${{ secrets.APPETIZE_API_TOKEN }}     # REQUIRED
+          APPETIZE_PUBLIC_KEY: ${{ secrets.APPETIZE_PUBLIC_KEY }}   # OPTIONAL (keep a stable link)
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "${APPETIZE_API_TOKEN:-}" ]] || { echo "Missing APPETIZE_API_TOKEN"; exit 1; }
+          
+          if [[ -n "${APPETIZE_PUBLIC_KEY:-}" ]]; then
+            RESP=$(curl -sS -X POST "https://api.appetize.io/v1/apps/${APPETIZE_PUBLIC_KEY}" \
+              -H "X-API-KEY: ${APPETIZE_API_TOKEN}" \
+              -F "file=@${ZIP_PATH}" \
+              -F "platform=ios")
+            PUBLIC_KEY="${APPETIZE_PUBLIC_KEY}"
+          else
+            RESP=$(curl -sS -X POST "https://api.appetize.io/v1/apps" \
+              -H "X-API-KEY: ${APPETIZE_API_TOKEN}" \
+              -F "file=@${ZIP_PATH}" \
+              -F "platform=ios")
+            PUBLIC_KEY=$(echo "$RESP" | python3 - <<'PY'
+            import sys, json
+            try:
+              data = json.load(sys.stdin)
+              print(data.get("publicKey") or data.get("buildId",""))
+            except Exception:
+              print("")
+              PY
+              )
+              fi
+            
+              if [[ -z "${PUBLIC_KEY}" ]]; then
+              echo "❌ Failed to obtain Appetize public key. Response:"; echo "$RESP"; exit 1
+              fi
+            
+              APPETIZE_URL="https://appetize.io/app/${PUBLIC_KEY}"
+              echo "public_key=${PUBLIC_KEY}" >> "$GITHUB_OUTPUT"
+              echo "url=${APPETIZE_URL}" >> "$GITHUB_OUTPUT"
+              echo "APPETIZE_URL=${APPETIZE_URL}" >> "$GITHUB_ENV"
+              echo "Appetize URL: ${APPETIZE_URL}"
+
+      - name: Upload build artifacts (.app and .zip)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-simulator-build
+          path: |
+            ${{ env.APP_PATH }}
+            ${{ env.ZIP_PATH }}
+
+      - name: Job summary with link
+        run: |
+          {
+            echo "### ✅ Appetize link"
+            echo ""
+            echo "${APPETIZE_URL}"
+            echo ""
+            echo "_Click to stream the iOS Simulator in your browser._"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment PR with the link
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const url = process.env.APPETIZE_URL;
+            if (!url) return;
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `✅ iOS Simulator build uploaded to Appetize:\n\n${url}`
+            });
